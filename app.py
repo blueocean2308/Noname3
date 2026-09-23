@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import re
 import time
-from urllib.parse import quote
 
 from flask import Flask, Response, request
 
@@ -33,53 +32,29 @@ UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
-
-def quality_rank(q: str) -> int:
-    """Higher = better. < 1080 → reject (return -1)."""
-    if not q:
-        return 0  # unknown — keep but rank low
-    s = q.lower().strip().replace(" ", "")
-    if any(x in s for x in ("360", "480", "240", "144", "sd")):
-        return -1
-    if "720" in s or s in ("hd",):
-        return -1  # sếp chỉ lấy 1080+
-    if "8k" in s or "4320" in s:
-        return 400
-    if "4k" in s or "2160" in s or "uhd" in s:
-        return 300
-    if "1080" in s or "fhd" in s or "fullhd" in s:
-        return 200
-    if "hd" in s:
-        return -1
-    return 0
-
-
-CACHE: dict = {}
-API_
-def quality_rank(q: str) -> int:
-    """Higher = better. < 1080 → reject (return -1)."""
-    if not q:
-        return 0  # unknown — keep but rank low
-    s = q.lower().strip().replace(" ", "")
-    if any(x in s for x in ("360", "480", "240", "144", "sd")):
-        return -1
-    if "720" in s or s in ("hd",):
-        return -1  # sếp chỉ lấy 1080+
-    if "8k" in s or "4320" in s:
-        return 400
-    if "4k" in s or "2160" in s or "uhd" in s:
-        return 300
-    if "1080" in s or "fhd" in s or "fullhd" in s:
-        return 200
-    if "hd" in s:
-        return -1
-    return 0
-
-
-CACHE: dict = {}
+CACHE = {}
+API_CACHE = {}
 CACHE_TTL = 600
 API_TTL = 300
 TMDB_TTL = 86400
+
+
+def quality_rank(q: str) -> int:
+    """Higher = better. Below 1080 → -1 (reject)."""
+    if not q:
+        return 0
+    s = q.lower().strip().replace(" ", "")
+    if any(x in s for x in ("360", "480", "240", "144", "sd")):
+        return -1
+    if "720" in s or s == "hd":
+        return -1
+    if "8k" in s or "4320" in s:
+        return 400
+    if "4k" in s or "2160" in s or "uhd" in s:
+        return 300
+    if "1080" in s or "fhd" in s or "fullhd" in s:
+        return 200
+    return 0
 
 
 def cors(resp: Response) -> Response:
@@ -131,18 +106,7 @@ def http_get(url: str, referer: str = REFERER, timeout: int = 20):
     return r
 
 
-def public_root() -> str:
-    host = request.headers.get("Host") or PUBLIC_HOST
-    if host.startswith("127.") or "localhost" in host:
-        host = PUBLIC_HOST
-    scheme = "https" if request.headers.get("X-Forwarded-Proto") == "https" else "http"
-    # VPS của sếp dùng http
-    return f"http://{host}"
-
-
-# ── TMDB ──────────────────────────────────────────────────────────
 def tmdb_find_imdb(imdb_id: str):
-    """tt1234567 → (media_type movie|tv, tmdb_id, title, year)."""
     key = f"tmdb_find:{imdb_id}"
     hit = api_get(key)
     if hit is not None:
@@ -174,9 +138,13 @@ def tmdb_from_tmdb_id(tmdb_id: int, prefer: str = "movie"):
     hit = api_get(key)
     if hit is not None:
         return hit
-    for mtype in ((prefer, "tv" if prefer == "movie" else "movie") if prefer else ("movie", "tv")):
+    order = [prefer, "tv" if prefer == "movie" else "movie"]
+    for mtype in order:
         try:
-            r = http_get(f"{TMDB}/{mtype}/{tmdb_id}?api_key={TMDB_KEY}", referer="https://www.themoviedb.org/")
+            r = http_get(
+                f"{TMDB}/{mtype}/{tmdb_id}?api_key={TMDB_KEY}",
+                referer="https://www.themoviedb.org/",
+            )
             if r.status_code == 200:
                 m = r.json()
                 title = m.get("title") or m.get("name") or ""
@@ -190,21 +158,17 @@ def tmdb_from_tmdb_id(tmdb_id: int, prefer: str = "movie"):
     return None
 
 
-# ── Rigel ─────────────────────────────────────────────────────────
-def rigel_streams(media_type: str, tmdb_id: int, season: int | None = None, episode: int | None = None):
+def rigel_streams(media_type: str, tmdb_id: int, season=None, episode=None):
     if media_type == "tv":
-        s = season or 1
-        e = episode or 1
-        path = f"tv/{tmdb_id}/{s}/{e}"
+        path = f"tv/{tmdb_id}/{season or 1}/{episode or 1}"
     else:
         path = f"movie/{tmdb_id}"
     key = f"rigel:{path}"
     hit = api_get(key)
     if hit is not None:
         return hit
-    url = f"{RIGEL}/{path}"
     try:
-        r = http_get(url, referer=REFERER, timeout=25)
+        r = http_get(f"{RIGEL}/{path}", referer=REFERER, timeout=25)
         if r.status_code != 200:
             return []
         data = r.json()
@@ -225,8 +189,7 @@ def rigel_streams(media_type: str, tmdb_id: int, season: int | None = None, epis
             quality = str(st.get("quality") or "").strip()
             rank = quality_rank(quality)
             if rank < 0:
-                continue  # dưới 1080p
-            # Bỏ quality trống nếu đã có bản có quality cao
+                continue
             stype = st.get("type") or ("hls" if ".m3u8" in u else "http")
             seen.add(u)
             out.append({
@@ -236,12 +199,10 @@ def rigel_streams(media_type: str, tmdb_id: int, season: int | None = None, epis
                 "type": stype,
                 "rank": rank,
             })
-        # Chỉ giữ ≥1080; nếu không có quality ghi rõ thì ưu tiên label Rigel 1 cái
         hi = [x for x in out if x["rank"] >= 200]
         if hi:
             out = hi
         else:
-            # không có 1080 label → lấy tối đa 2 URL khác nhau (tránh đống Lyra trùng cảm giác)
             out = out[:2]
         out.sort(key=lambda x: (-x["rank"], x["label"]))
         api_put(key, out, API_TTL)
@@ -251,26 +212,18 @@ def rigel_streams(media_type: str, tmdb_id: int, season: int | None = None, epis
 
 
 def parse_stremio_id(raw: str):
-    """
-    tt1234567 | tt1234567:1:5 | tmdb:533535 | tmdb:1396:1:1 | 533535
-    → (kind, id_or_tt, season, episode)
-    kind: imdb | tmdb
-    """
     raw = (raw or "").replace(".json", "").strip()
     season = episode = None
-    # tmdb:123 or tmdb:123:1:2
     m = re.match(r"^tmdb:(\d+)(?::(\d+):(\d+))?$", raw, re.I)
     if m:
         if m.group(2):
             season, episode = int(m.group(2)), int(m.group(3))
         return "tmdb", int(m.group(1)), season, episode
-    # tt1234567:1:5
     m = re.match(r"^(tt\d+)(?::(\d+):(\d+))?$", raw, re.I)
     if m:
         if m.group(2):
             season, episode = int(m.group(2)), int(m.group(3))
         return "imdb", m.group(1).lower(), season, episode
-    # bare number as tmdb
     if raw.isdigit():
         return "tmdb", int(raw), None, None
     return None, None, None, None
@@ -283,12 +236,9 @@ def build_stream_objs(items, title: str, year: str, media_type: str, season, epi
         if q and q.upper() in ("HD", "HIGH"):
             q = "FHD"
         label = it.get("label") or "Rigel"
-        # title block kiểu KK/NguonC
         ep_line = ""
         if media_type == "tv" and season is not None and episode is not None:
             ep_line = f" · S{season:02d}E{episode:02d}"
-        elif media_type == "tv" and episode is not None:
-            ep_line = f" · Tập {episode}"
         detail = f"{title}"
         if year:
             detail += f" ({year})"
@@ -296,31 +246,26 @@ def build_stream_objs(items, title: str, year: str, media_type: str, season, epi
         if q:
             detail += f"\n{q}"
         detail += f"\nVidCore · {label}"
-        name = f"VidCore"
-        if q:
-            name = f"VidCore {q}"
-        streams.append(
-            {
-                "name": name,
-                "title": detail,
-                "url": it["url"],
-                "behaviorHints": {
-                    "notWebReady": True,
-                    "bingeGroup": f"vidcore-{label}-{i}",
-                    "proxyHeaders": {
-                        "request": {
-                            "Referer": REFERER,
-                            "Origin": ORIGIN,
-                            "User-Agent": UA,
-                        }
-                    },
+        name = f"VidCore {q}".strip() if q else "VidCore"
+        streams.append({
+            "name": name,
+            "title": detail,
+            "url": it["url"],
+            "behaviorHints": {
+                "notWebReady": True,
+                "bingeGroup": f"vidcore-{label}-{i}",
+                "proxyHeaders": {
+                    "request": {
+                        "Referer": REFERER,
+                        "Origin": ORIGIN,
+                        "User-Agent": UA,
+                    }
                 },
-            }
-        )
+            },
+        })
     return streams
 
 
-# ── Routes ────────────────────────────────────────────────────────
 @app.route("/")
 def root():
     return j({"ok": True, "version": ADDON_VERSION, "manifest": "/manifest.json", "name": ADDON_NAME})
@@ -328,20 +273,18 @@ def root():
 
 @app.route("/manifest.json")
 def manifest():
-    return j(
-        {
-            "id": ADDON_ID,
-            "version": ADDON_VERSION,
-            "name": ADDON_NAME,
-            "description": "VidCore streams via Rigel (TMDB → m3u8)",
-            "logo": "https://www.google.com/s2/favicons?domain=vidcore.org&sz=128",
-            "resources": ["stream"],
-            "types": ["movie", "series"],
-            "idPrefixes": ["tt", "tmdb:"],
-            "catalogs": [],
-            "behaviorHints": {"configurable": False, "adult": False},
-        }
-    )
+    return j({
+        "id": ADDON_ID,
+        "version": ADDON_VERSION,
+        "name": ADDON_NAME,
+        "description": "VidCore streams via Rigel (TMDB → m3u8) · 1080p+",
+        "logo": "https://www.google.com/s2/favicons?domain=vidcore.org&sz=128",
+        "resources": ["stream"],
+        "types": ["movie", "series"],
+        "idPrefixes": ["tt", "tmdb:"],
+        "catalogs": [],
+        "behaviorHints": {"configurable": False, "adult": False},
+    })
 
 
 @app.route("/stream/<stype>/<path:sid>")
@@ -360,7 +303,6 @@ def stream(stype, sid):
         if not found:
             return j({"streams": []})
         mtype, tmdb_id, title, year = found
-        # series id with :s:e overrides
         if season is not None:
             media_type = "tv"
         else:
