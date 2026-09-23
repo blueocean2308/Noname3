@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""VidCore stream addon for Nuvio/Stremio — Rigel (movish.to) → m3u8 · 1080p+ only."""
+"""VidCore stream addon — Rigel → m3u8. Prefer 1080p+, skip explicit low-res."""
 from __future__ import annotations
 
 import json
@@ -17,7 +17,7 @@ except ImportError:
 
 app = Flask(__name__)
 
-ADDON_VERSION = "1.0.2"
+ADDON_VERSION = "1.0.3"
 ADDON_NAME = "VidCore"
 ADDON_ID = "org.nuvio.vidcore"
 PUBLIC_HOST = "168.138.176.147:51824"
@@ -33,22 +33,37 @@ UA = (
 )
 
 API_CACHE = {}
-API_TTL = 300
+API_TTL = 180
 TMDB_TTL = 86400
 
 
-def quality_rank(q: str) -> int:
-    """Only 1080p / 4K / 8K pass. Everything else rejected."""
-    if not q:
+def quality_rank(q: str, label: str = "") -> int:
+    """
+    400/300/200 = 8K/4K/1080 explicit
+    100 = unknown quality (keep, prefer label Rigel)
+    -1 = explicit low (360/480/720)
+    """
+    s = (q or "").lower().strip().replace(" ", "")
+    lab = (label or "").lower()
+    if s:
+        if any(x in s for x in ("360", "480", "240", "144", "sd")):
+            return -1
+        if "720" in s and "1720" not in s:
+            return -1
+        if s in ("hd",) and "fhd" not in s and "1080" not in s:
+            return -1
+        if "8k" in s or "4320" in s:
+            return 400
+        if "4k" in s or "2160" in s or "uhd" in s:
+            return 300
+        if "1080" in s or "fhd" in s or "fullhd" in s:
+            return 200
+    # no quality string — assume usable unless label screams low
+    if any(x in lab for x in ("360", "480", "720")):
         return -1
-    s = q.lower().strip().replace(" ", "")
-    if "8k" in s or "4320" in s:
-        return 400
-    if "4k" in s or "2160" in s or "uhd" in s:
-        return 300
-    if "1080" in s or "fhd" in s or "fullhd" in s:
-        return 200
-    return -1
+    if "rigel" in lab:
+        return 150  # primary mirror, often 1080 without tag
+    return 100
 
 
 def cors(resp: Response) -> Response:
@@ -175,20 +190,28 @@ def rigel_streams(media_type: str, tmdb_id: int, season=None, episode=None):
                 continue
             if u in seen:
                 continue
+            label = str(st.get("label") or st.get("name") or data.get("label") or "Rigel")
             quality = str(st.get("quality") or "").strip()
-            rank = quality_rank(quality)
-            if rank < 200:
+            rank = quality_rank(quality, label)
+            if rank < 0:
                 continue
-            label = st.get("label") or st.get("name") or data.get("label") or "Rigel"
             stype = st.get("type") or ("hls" if ".m3u8" in u else "http")
             seen.add(u)
             out.append({
                 "url": u,
-                "label": str(label),
+                "label": label,
                 "quality": quality,
                 "type": stype,
                 "rank": rank,
             })
+        # Prefer explicit 1080+ ; else Rigel-ish ; max 3 streams
+        hi = [x for x in out if x["rank"] >= 200]
+        if hi:
+            out = hi
+        else:
+            rig = [x for x in out if x["rank"] >= 150]
+            out = rig if rig else out
+            out = out[:3]
         out.sort(key=lambda x: (-x["rank"], x["label"]))
         api_put(key, out, API_TTL)
         return out
@@ -217,7 +240,11 @@ def parse_stremio_id(raw: str):
 def build_stream_objs(items, title: str, year: str, media_type: str, season, episode):
     streams = []
     for i, it in enumerate(items):
-        q = it.get("quality") or "1080p"
+        q = it.get("quality") or ""
+        if not q and it.get("rank", 0) >= 150:
+            q = "FHD"
+        elif not q:
+            q = "HD"
         label = it.get("label") or "Rigel"
         ep_line = ""
         if media_type == "tv" and season is not None and episode is not None:
@@ -225,8 +252,7 @@ def build_stream_objs(items, title: str, year: str, media_type: str, season, epi
         detail = title or "VidCore"
         if year:
             detail += f" ({year})"
-        detail += ep_line
-        detail += f"\n{q}\nVidCore · {label}"
+        detail += ep_line + f"\n{q}\nVidCore · {label}"
         streams.append({
             "name": f"VidCore {q}",
             "title": detail,
@@ -257,7 +283,7 @@ def manifest():
         "id": ADDON_ID,
         "version": ADDON_VERSION,
         "name": ADDON_NAME,
-        "description": "VidCore · Rigel · chỉ 1080p / 4K",
+        "description": "VidCore · Rigel · ưu tiên 1080p, bỏ 360/480/720",
         "logo": "https://www.google.com/s2/favicons?domain=vidcore.org&sz=128",
         "resources": ["stream"],
         "types": ["movie", "series"],
