@@ -18,7 +18,7 @@ except ImportError:
 
 app = Flask(__name__)
 
-ADDON_VERSION = "1.0.0"
+ADDON_VERSION = "1.0.1"
 ADDON_NAME = "VidCore"
 ADDON_ID = "org.nuvio.vidcore"
 PUBLIC_HOST = "168.138.176.147:51824"
@@ -33,8 +33,50 @@ UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
+
+def quality_rank(q: str) -> int:
+    """Higher = better. < 1080 → reject (return -1)."""
+    if not q:
+        return 0  # unknown — keep but rank low
+    s = q.lower().strip().replace(" ", "")
+    if any(x in s for x in ("360", "480", "240", "144", "sd")):
+        return -1
+    if "720" in s or s in ("hd",):
+        return -1  # sếp chỉ lấy 1080+
+    if "8k" in s or "4320" in s:
+        return 400
+    if "4k" in s or "2160" in s or "uhd" in s:
+        return 300
+    if "1080" in s or "fhd" in s or "fullhd" in s:
+        return 200
+    if "hd" in s:
+        return -1
+    return 0
+
+
 CACHE: dict = {}
-API_CACHE: dict = {}
+API_
+def quality_rank(q: str) -> int:
+    """Higher = better. < 1080 → reject (return -1)."""
+    if not q:
+        return 0  # unknown — keep but rank low
+    s = q.lower().strip().replace(" ", "")
+    if any(x in s for x in ("360", "480", "240", "144", "sd")):
+        return -1
+    if "720" in s or s in ("hd",):
+        return -1  # sếp chỉ lấy 1080+
+    if "8k" in s or "4320" in s:
+        return 400
+    if "4k" in s or "2160" in s or "uhd" in s:
+        return 300
+    if "1080" in s or "fhd" in s or "fullhd" in s:
+        return 200
+    if "hd" in s:
+        return -1
+    return 0
+
+
+CACHE: dict = {}
 CACHE_TTL = 600
 API_TTL = 300
 TMDB_TTL = 86400
@@ -170,16 +212,38 @@ def rigel_streams(media_type: str, tmdb_id: int, season: int | None = None, epis
         if not isinstance(streams, list):
             return []
         out = []
+        seen = set()
         for st in streams:
             if not isinstance(st, dict):
                 continue
             u = st.get("url")
             if not u or not isinstance(u, str) or not u.startswith("http"):
                 continue
+            if u in seen:
+                continue
             label = st.get("label") or st.get("name") or data.get("label") or "Rigel"
-            quality = st.get("quality") or ""
+            quality = str(st.get("quality") or "").strip()
+            rank = quality_rank(quality)
+            if rank < 0:
+                continue  # dưới 1080p
+            # Bỏ quality trống nếu đã có bản có quality cao
             stype = st.get("type") or ("hls" if ".m3u8" in u else "http")
-            out.append({"url": u, "label": str(label), "quality": str(quality or ""), "type": stype})
+            seen.add(u)
+            out.append({
+                "url": u,
+                "label": str(label),
+                "quality": quality,
+                "type": stype,
+                "rank": rank,
+            })
+        # Chỉ giữ ≥1080; nếu không có quality ghi rõ thì ưu tiên label Rigel 1 cái
+        hi = [x for x in out if x["rank"] >= 200]
+        if hi:
+            out = hi
+        else:
+            # không có 1080 label → lấy tối đa 2 URL khác nhau (tránh đống Lyra trùng cảm giác)
+            out = out[:2]
+        out.sort(key=lambda x: (-x["rank"], x["label"]))
         api_put(key, out, API_TTL)
         return out
     except Exception:
