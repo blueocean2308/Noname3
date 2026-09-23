@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""VidCore stream addon for Nuvio/Stremio — Rigel (movish.to) → m3u8."""
+"""VidCore stream addon for Nuvio/Stremio — Rigel (movish.to) → m3u8 · 1080p+ only."""
 from __future__ import annotations
 
 import json
@@ -17,7 +17,7 @@ except ImportError:
 
 app = Flask(__name__)
 
-ADDON_VERSION = "1.0.1"
+ADDON_VERSION = "1.0.2"
 ADDON_NAME = "VidCore"
 ADDON_ID = "org.nuvio.vidcore"
 PUBLIC_HOST = "168.138.176.147:51824"
@@ -32,29 +32,23 @@ UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
-CACHE = {}
 API_CACHE = {}
-CACHE_TTL = 600
 API_TTL = 300
 TMDB_TTL = 86400
 
 
 def quality_rank(q: str) -> int:
-    """Higher = better. Below 1080 → -1 (reject)."""
+    """Only 1080p / 4K / 8K pass. Everything else rejected."""
     if not q:
-        return 0
+        return -1
     s = q.lower().strip().replace(" ", "")
-    if any(x in s for x in ("360", "480", "240", "144", "sd")):
-        return -1
-    if "720" in s or s == "hd":
-        return -1
     if "8k" in s or "4320" in s:
         return 400
     if "4k" in s or "2160" in s or "uhd" in s:
         return 300
     if "1080" in s or "fhd" in s or "fullhd" in s:
         return 200
-    return 0
+    return -1
 
 
 def cors(resp: Response) -> Response:
@@ -65,10 +59,12 @@ def cors(resp: Response) -> Response:
 
 
 def j(data, status=200):
-    return cors(Response(json.dumps(data, ensure_ascii=False), status=status, mimetype="application/json"))
+    return cors(
+        Response(json.dumps(data, ensure_ascii=False), status=status, mimetype="application/json")
+    )
 
 
-def _prune(store: dict, limit=300):
+def _prune(store: dict, limit=400):
     now = time.time()
     for k in [k for k, v in list(store.items()) if v[1] <= now]:
         store.pop(k, None)
@@ -88,7 +84,7 @@ def api_get(key):
 
 
 def api_put(key, data, ttl):
-    _prune(API_CACHE, 400)
+    _prune(API_CACHE)
     API_CACHE[key] = (data, time.time() + ttl)
 
 
@@ -100,10 +96,8 @@ def http_get(url: str, referer: str = REFERER, timeout: int = 20):
         "Origin": ORIGIN,
     }
     if HAS_CFFI:
-        r = creq.get(url, headers=headers, impersonate="chrome120", timeout=timeout)
-    else:
-        r = creq.get(url, headers=headers, timeout=timeout)
-    return r
+        return creq.get(url, headers=headers, impersonate="chrome120", timeout=timeout)
+    return creq.get(url, headers=headers, timeout=timeout)
 
 
 def tmdb_find_imdb(imdb_id: str):
@@ -121,11 +115,9 @@ def tmdb_find_imdb(imdb_id: str):
             arr = d.get(field) or []
             if arr:
                 m = arr[0]
-                tid = m.get("id")
                 title = m.get("title") or m.get("name") or ""
                 date = m.get("release_date") or m.get("first_air_date") or ""
-                year = date[:4] if date else ""
-                res = (mtype, tid, title, year)
+                res = (mtype, m.get("id"), title, date[:4] if date else "")
                 api_put(key, res, TMDB_TTL)
                 return res
     except Exception:
@@ -138,8 +130,7 @@ def tmdb_from_tmdb_id(tmdb_id: int, prefer: str = "movie"):
     hit = api_get(key)
     if hit is not None:
         return hit
-    order = [prefer, "tv" if prefer == "movie" else "movie"]
-    for mtype in order:
+    for mtype in (prefer, "tv" if prefer == "movie" else "movie"):
         try:
             r = http_get(
                 f"{TMDB}/{mtype}/{tmdb_id}?api_key={TMDB_KEY}",
@@ -149,8 +140,7 @@ def tmdb_from_tmdb_id(tmdb_id: int, prefer: str = "movie"):
                 m = r.json()
                 title = m.get("title") or m.get("name") or ""
                 date = m.get("release_date") or m.get("first_air_date") or ""
-                year = date[:4] if date else ""
-                res = (mtype, tmdb_id, title, year)
+                res = (mtype, tmdb_id, title, date[:4] if date else "")
                 api_put(key, res, TMDB_TTL)
                 return res
         except Exception:
@@ -185,11 +175,11 @@ def rigel_streams(media_type: str, tmdb_id: int, season=None, episode=None):
                 continue
             if u in seen:
                 continue
-            label = st.get("label") or st.get("name") or data.get("label") or "Rigel"
             quality = str(st.get("quality") or "").strip()
             rank = quality_rank(quality)
-            if rank < 0:
+            if rank < 200:
                 continue
+            label = st.get("label") or st.get("name") or data.get("label") or "Rigel"
             stype = st.get("type") or ("hls" if ".m3u8" in u else "http")
             seen.add(u)
             out.append({
@@ -199,11 +189,6 @@ def rigel_streams(media_type: str, tmdb_id: int, season=None, episode=None):
                 "type": stype,
                 "rank": rank,
             })
-        hi = [x for x in out if x["rank"] >= 200]
-        if hi:
-            out = hi
-        else:
-            out = out[:2]
         out.sort(key=lambda x: (-x["rank"], x["label"]))
         api_put(key, out, API_TTL)
         return out
@@ -232,23 +217,18 @@ def parse_stremio_id(raw: str):
 def build_stream_objs(items, title: str, year: str, media_type: str, season, episode):
     streams = []
     for i, it in enumerate(items):
-        q = it.get("quality") or ""
-        if q and q.upper() in ("HD", "HIGH"):
-            q = "FHD"
+        q = it.get("quality") or "1080p"
         label = it.get("label") or "Rigel"
         ep_line = ""
         if media_type == "tv" and season is not None and episode is not None:
             ep_line = f" · S{season:02d}E{episode:02d}"
-        detail = f"{title}"
+        detail = title or "VidCore"
         if year:
             detail += f" ({year})"
         detail += ep_line
-        if q:
-            detail += f"\n{q}"
-        detail += f"\nVidCore · {label}"
-        name = f"VidCore {q}".strip() if q else "VidCore"
+        detail += f"\n{q}\nVidCore · {label}"
         streams.append({
-            "name": name,
+            "name": f"VidCore {q}",
             "title": detail,
             "url": it["url"],
             "behaviorHints": {
@@ -277,7 +257,7 @@ def manifest():
         "id": ADDON_ID,
         "version": ADDON_VERSION,
         "name": ADDON_NAME,
-        "description": "VidCore streams via Rigel (TMDB → m3u8) · 1080p+",
+        "description": "VidCore · Rigel · chỉ 1080p / 4K",
         "logo": "https://www.google.com/s2/favicons?domain=vidcore.org&sz=128",
         "resources": ["stream"],
         "types": ["movie", "series"],
@@ -303,10 +283,7 @@ def stream(stype, sid):
         if not found:
             return j({"streams": []})
         mtype, tmdb_id, title, year = found
-        if season is not None:
-            media_type = "tv"
-        else:
-            media_type = mtype
+        media_type = "tv" if season is not None else mtype
     else:
         tmdb_id = int(ident)
         meta = tmdb_from_tmdb_id(tmdb_id, prefer=media_type)
@@ -322,8 +299,11 @@ def stream(stype, sid):
     if not items:
         return j({"streams": []})
 
-    streams = build_stream_objs(items, title or f"TMDB {tmdb_id}", year, media_type, season, episode)
-    return j({"streams": streams})
+    return j({
+        "streams": build_stream_objs(
+            items, title or f"TMDB {tmdb_id}", year, media_type, season, episode
+        )
+    })
 
 
 @app.route("/<path:_any>", methods=["OPTIONS"])
