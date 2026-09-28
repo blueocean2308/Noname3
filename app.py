@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 APP_NAME = "K20-Lite"
 APP_ID = "org.nuvio.k20lite"
 VERSION = "1.0.0"
-PORT_HINT = 51823
+PORT_HINT = 51824
 
 TMDB_KEY = "1adf1a2b5aece0ac5106302d3299f56f"
 TMDB = "https://api.themoviedb.org/3"
@@ -434,12 +434,12 @@ async def health():
 
 
 @app.get("/test/unabomber")
-async def test_unabomber():
+async def test_unabomber(request: Request):
     # tt6933238 / tmdb 1492640
-    return await stream("movie", "tt6933238.json", Request, debug=1)  # type: ignore
+    return await stream("movie", "tt6933238.json", request, debug=1)
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=51823)
+    uvicorn.run(app, host="0.0.0.0", port=51824)
