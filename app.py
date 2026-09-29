@@ -23,7 +23,7 @@ except ImportError:  # pragma: no cover
 
 APP_NAME = "Atlantic"
 APP_ID = "org.nuvio.atlantic"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 PUBLIC_HOST = "168.138.176.147:51824"
 PORT = 51824
 
@@ -424,10 +424,12 @@ def build_stream_entry(meta: dict, is_tv: bool, season, episode, item: dict) -> 
             f"TMDb {meta['tmdb']}" + (f" · IMDb {imdb}" if imdb else ""),
         ]
     )
+    # Master playlist nếu có — player tự chọn quality; CDN bắt buộc Referer
+    play_url = item.get("master") or item.get("url") or ""
     return {
         "name": f"{APP_NAME} · {qlabel}",
         "title": title,
-        "url": item["url"],
+        "url": play_url,
         "behaviorHints": {
             "notWebReady": True,
             "bingeGroup": f"atlantic-{meta['tmdb']}-{src}-{h}",
@@ -437,6 +439,8 @@ def build_stream_entry(meta: dict, is_tv: bool, season, episode, item: dict) -> 
                     "User-Agent": UA,
                     "Referer": "https://atlantic.st/",
                     "Origin": "https://atlantic.st",
+                    "Accept": "*/*",
+                    "Accept-Language": "en-US,en;q=0.9",
                 }
             },
         },
