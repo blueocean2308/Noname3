@@ -1,41 +1,28 @@
 #!/usr/bin/env python3
-"""Atlantic addon for Nuvio/Stremio — Helios + Aphrodite (atlantic.st).
-
-Getlink only. Stream URL trỏ CDN trực tiếp (không stream video qua VPS).
-Upload: https://raw.githubusercontent.com/blueocean2308/Noname3/refs/heads/main/app.py
-"""
+"""Movy addon for Nuvio — www.movy.sx (api.wecollege.net). Getlink only."""
 from __future__ import annotations
 
-import binascii
+import asyncio
+import base64
+import json
 import re
 import time
 from typing import Any, Optional
-from urllib.parse import urljoin
 
 import httpx
 from fastapi import FastAPI, Response
 from fastapi.responses import JSONResponse
 
-try:
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-except ImportError:  # pragma: no cover
-    AESGCM = None  # type: ignore
-
-APP_NAME = "Atlantic"
-APP_ID = "org.nuvio.atlantic"
+APP_NAME = "Movy"
+APP_ID = "org.nuvio.movy"
 VERSION = "1.0.1"
-PUBLIC_HOST = "168.138.176.147:51824"
 PORT = 51824
-
+STREAM_API = "https://api.wecollege.net"
+CITIES = ["miami", "seattle", "denver", "atlanta", "phoenix", "portland", "boise", "austin"]
+MIN_HEIGHT = 1080
 TMDB_KEY = "1adf1a2b5aece0ac5106302d3299f56f"
 TMDB = "https://api.themoviedb.org/3"
 CINEMETA = "https://v3-cinemeta.strem.io"
-
-HELIOS = "https://stream.hls.lol/helios"
-APHRODITE = "https://cdn.hls.lol"
-# Key from atlantic.st frontend (AES-GCM, hex)
-HELIOS_KEY_HEX = "117c358bcfcaf8fe2cfca57c9d2238a300e1c4de2efb83a5012ba84d8a31f1dd"
-
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -43,15 +30,20 @@ UA = (
 HDR = {
     "User-Agent": UA,
     "Accept": "application/json,*/*",
-    "Referer": "https://atlantic.st/",
-    "Origin": "https://atlantic.st",
+    "Referer": "https://www.movy.sx/",
+    "Origin": "https://www.movy.sx",
 }
-MIN_HEIGHT = 1080
-CACHE_TTL = 240
-_cache: dict[str, tuple[float, Any]] = {}
-
+_D = [
+    0x428A2F98, 0x71374491, 0xB5C0FBCF, 0xE9B5DBA5,
+    0x3956C25B, 0x59F111F1, 0x923F82A4, 0xAB1C5ED5,
+    0xD807AA98, 0x12835B01, 0x243185BE, 0x550C7DC3,
+    0x72BE5D74, 0x80DEB1FE, 0x9BDC06A7, 0xC19BF174,
+]
+_MAGIC = bytes([109, 118, 109, 49])
+CACHE_TTL = 180
+_cache: dict = {}
+_seed_cache: dict = {}
 app = FastAPI(title=APP_NAME)
-
 
 def cors(resp: Response) -> Response:
     resp.headers["Access-Control-Allow-Origin"] = "*"
@@ -59,13 +51,11 @@ def cors(resp: Response) -> Response:
     resp.headers["Access-Control-Allow-Methods"] = "GET, HEAD, OPTIONS"
     return resp
 
-
 @app.options("/{path:path}")
 async def options_all(path: str):
     return cors(Response(status_code=204))
 
-
-def cache_get(key: str):
+def cache_get(key):
     item = _cache.get(key)
     if not item:
         return None
@@ -75,12 +65,102 @@ def cache_get(key: str):
         return None
     return val
 
-
-def cache_set(key: str, val: Any):
+def cache_set(key, val):
     _cache[key] = (time.time(), val)
 
+def u32(x):
+    return x & 0xFFFFFFFF
 
-def parse_stream_id(raw: str):
+def _o(e):
+    e = u32(e)
+    e ^= e >> 16
+    e = u32(e * 0x85EBCA6B)
+    e ^= e >> 13
+    e = u32(e * 0xC2B2AE35)
+    e ^= e >> 16
+    return u32(e)
+
+def _rotl(e, a):
+    e = u32(e)
+    a &= 31
+    if a == 0:
+        return e
+    return u32((e << a) | (e >> (32 - a)))
+
+def streamcrypto_decrypt(cipher_b64, seed, media_id):
+    e = seed
+    a = int(media_id)
+    b64 = cipher_b64.replace("-", "+").replace("_", "/")
+    b64 += "=" * ((4 - len(b64) % 4) % 4)
+    n = bytearray(base64.b64decode(b64))
+    tlen = len(e)
+    if (tlen * (tlen + 1) & 1) == 1:
+        S = list(range(256))
+        present = set(range(256))
+        tt = 0
+        for s in range(256):
+            tt = (tt + S[s] + ord(e[s % tlen])) & 255
+            S[s], S[tt] = S[tt], S[s]
+        acc = 0x67452301
+        for t in range(tlen):
+            acc = _rotl(u32(acc ^ u32(ord(e[t]) * _D[15 & t])), 5)
+        acc = _o(acc)
+    else:
+        S = [0] * 61
+        present = set()
+        n0 = 0x811C9DC5
+        for t in range(tlen):
+            n0 = u32((n0 ^ ord(e[t])) * 0x1000193)
+        n0 = _o(n0)
+        nv = _o(n0 ^ _o(u32(a) ^ 0x9E3779B9))
+        for ei in range(8):
+            if (ei * (ei + 1) & 1) == 0:
+                ai = nv % 61
+                nv = _rotl(u32(nv + 0x9E3779B9), 7 + (7 & ei))
+                S[ai] = u32(nv ^ _o(nv))
+                present.add(ai)
+                nv = _o(u32(nv + ai))
+            else:
+                S[ei] = _D[15 & ei]
+                present.add(ei)
+        acc = _o(0xA5A5A5A5 ^ nv)
+    ks = bytearray(len(n))
+    l = 0
+    ei = 0
+    while ei < len(n):
+        lv = acc
+        dv = lv % 61
+        iv = u32(-1) if dv in present else 0
+        rv = u32(S[dv]) if dv in present else 0
+        cv = u32(0x9E3779B9 * (l + 1))
+        t = lv
+        s = u32(rv ^ cv)
+        b = u32(u32(t ^ s) | u32(t & s & iv))
+        b = u32(_rotl(u32(b + lv), 31 & dv) ^ _rotl(lv, 31 & u32(dv * 7)))
+        lv = _o(u32(b + 0x9E3779B9))
+        S[dv] = lv
+        present.add(dv)
+        acc = lv
+        word = lv
+        l += 1
+        ks[ei] = word & 255
+        ei += 1
+        if ei < len(n):
+            ks[ei] = (word >> 8) & 255
+            ei += 1
+        if ei < len(n):
+            ks[ei] = (word >> 16) & 255
+            ei += 1
+        if ei < len(n):
+            ks[ei] = (word >> 24) & 255
+            ei += 1
+    for i in range(len(n)):
+        n[i] ^= ks[i]
+    if bytes(n[:4]) != _MAGIC:
+        raise ValueError("STREAMCRYPTO decrypt failed")
+    return bytes(n[4:]).decode("utf-8")
+
+def parse_stream_id(raw):
     raw = raw.replace(".json", "")
     season = episode = None
     if ":" in raw:
@@ -97,26 +177,23 @@ def parse_stream_id(raw: str):
         id_core = raw
     return id_core, season, episode
 
+def height_from_text(s):
+    """Ưu tiên path URL (index-s1080p /s720p/ ...) — nhãn API hay sai."""
+    s = (s or "").lower()
+    if re.search(r"(2160p|4k|uhd)", s):
+        return 2160
+    if re.search(r"1440p", s):
+        return 1440
+    if re.search(r"1080p|fhd", s):
+        return 1080
+    if re.search(r"(720p|/720/)", s):
+        return 720
+    if re.search(r"(480p|360p|240p|/480/|/360/)", s):
+        return 480
+    m = re.search(r"(\d{3,4})\s*p", s)
+    return int(m.group(1)) if m else 0
 
-def decrypt_helios(payload: str) -> Optional[str]:
-    if not payload:
-        return None
-    if not payload.startswith("hl_"):
-        return payload
-    if AESGCM is None:
-        return None
-    try:
-        raw = binascii.unhexlify(payload[3:])
-        if len(raw) < 28:
-            return None
-        key = binascii.unhexlify(HELIOS_KEY_HEX)
-        iv, ct = raw[:12], raw[12:]
-        return AESGCM(key).decrypt(iv, ct, None).decode("utf-8")
-    except Exception:
-        return None
-
-
-def height_label(h: int) -> str:
+def height_label(h):
     if h >= 2160:
         return "4K 2160p"
     if h >= 1440:
@@ -127,196 +204,14 @@ def height_label(h: int) -> str:
         return "720p"
     return f"{h}p" if h else "Auto"
 
-
-def parse_master_variants(text: str, base_url: str) -> list[tuple[int, str]]:
-    """Return list of (height, absolute_url) from HLS master."""
-    out: list[tuple[int, str]] = []
-    lines = text.splitlines()
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        if line.startswith("#EXT-X-STREAM-INF"):
-            hm = re.search(r"RESOLUTION=\d+x(\d+)", line, re.I)
-            h = int(hm.group(1)) if hm else 0
-            j = i + 1
-            while j < len(lines) and (not lines[j].strip() or lines[j].strip().startswith("#")):
-                j += 1
-            if j < len(lines):
-                u = lines[j].strip()
-                if not u.startswith("http"):
-                    u = urljoin(base_url, u)
-                out.append((h, u))
-            i = j + 1
-            continue
-        i += 1
-    return out
-
-
-async def fetch_text(client: httpx.AsyncClient, url: str) -> Optional[str]:
-    try:
-        r = await client.get(url, headers=HDR, timeout=25.0)
-        if r.status_code != 200:
-            return None
-        return r.text
-    except Exception:
-        return None
-
-
-async def helios_streams(
-    client: httpx.AsyncClient,
-    tmdb_id: str,
-    is_tv: bool,
-    season: Optional[int],
-    episode: Optional[int],
-    notes: list,
-) -> list[dict]:
-    params: dict[str, Any] = {"tmdbId": tmdb_id, "type": "tv" if is_tv else "movie"}
-    if is_tv:
-        params["seasonId"] = season or 1
-        params["episodeId"] = episode or 1
-    try:
-        r = await client.get(HELIOS, params=params, timeout=20.0)
-        notes.append(f"helios={r.status_code}")
-        if r.status_code != 200:
-            return []
-        j = r.json() or {}
-        sources = (j.get("sources") or {})
-        # Prefer Moscow; keep any other servers if present
-        items = []
-        if isinstance(sources, dict):
-            for name, obj in sources.items():
-                if isinstance(obj, dict) and obj.get("url"):
-                    items.append((name, obj))
-        if not items:
-            notes.append("helios empty")
-            return []
-
-        streams = []
-        for server_name, obj in items:
-            raw = obj.get("url") or ""
-            plain = decrypt_helios(raw)
-            if not plain or not plain.startswith("http"):
-                notes.append(f"helios decrypt fail {server_name}")
-                continue
-            text = await fetch_text(client, plain)
-            if not text or not text.lstrip().startswith("#EXTM3U"):
-                notes.append(f"helios playlist fail {server_name}")
-                continue
-
-            variants = parse_master_variants(text, plain)
-            if variants:
-                keep = [v for v in variants if v[0] >= MIN_HEIGHT]
-                if not keep:
-                    keep = [max(variants, key=lambda x: x[0])]
-                for h, u in sorted(keep, key=lambda x: -x[0]):
-                    streams.append(
-                        {
-                            "src": "Helios",
-                            "server": server_name,
-                            "height": h,
-                            "url": u,
-                            "master": plain,
-                        }
-                    )
-            else:
-                # media playlist
-                streams.append(
-                    {
-                        "src": "Helios",
-                        "server": server_name,
-                        "height": 1080,
-                        "url": plain,
-                        "master": plain,
-                    }
-                )
-        notes.append(f"helios_n={len(streams)}")
-        return streams
-    except Exception as e:
-        notes.append(f"helios EX {e}")
-        return []
-
-
-async def aphrodite_streams(
-    client: httpx.AsyncClient,
-    tmdb_id: str,
-    is_tv: bool,
-    season: Optional[int],
-    episode: Optional[int],
-    notes: list,
-) -> list[dict]:
-    if is_tv:
-        path = f"/content/tv/{tmdb_id}/{season or 1}/{episode or 1}"
-    else:
-        path = f"/content/movie/{tmdb_id}"
-    try:
-        r = await client.get(APHRODITE + path, timeout=20.0)
-        notes.append(f"aphrodite={r.status_code}")
-        if r.status_code != 200:
-            return []
-        j = r.json() or {}
-        if not j.get("found"):
-            notes.append("aphrodite not found")
-            return []
-        u = j.get("hls") or j.get("url") or ""
-        if not u.startswith("http"):
-            return []
-        text = await fetch_text(client, u)
-        if not text or not text.lstrip().startswith("#EXTM3U"):
-            notes.append("aphrodite playlist fail")
-            # vẫn trả URL gốc — player tự thử
-            return [
-                {
-                    "src": "Aphrodite",
-                    "server": "Aphrodite",
-                    "height": 1080,
-                    "url": u,
-                    "master": u,
-                }
-            ]
-        variants = parse_master_variants(text, u)
-        if variants:
-            keep = [v for v in variants if v[0] >= MIN_HEIGHT]
-            if not keep:
-                keep = [max(variants, key=lambda x: x[0])]
-            out = []
-            for h, vu in sorted(keep, key=lambda x: -x[0]):
-                out.append(
-                    {
-                        "src": "Aphrodite",
-                        "server": "Aphrodite",
-                        "height": h,
-                        "url": vu,
-                        "master": u,
-                    }
-                )
-            notes.append(f"aphrodite_n={len(out)}")
-            return out
-        notes.append("aphrodite_n=1 media")
-        return [
-            {
-                "src": "Aphrodite",
-                "server": "Aphrodite",
-                "height": 1080,
-                "url": u,
-                "master": u,
-            }
-        ]
-    except Exception as e:
-        notes.append(f"aphrodite EX {e}")
-        return []
-
-
-async def tmdb_get(client: httpx.AsyncClient, path: str, params: Optional[dict] = None):
+async def tmdb_get(client, path, params=None):
     p = {"api_key": TMDB_KEY, "language": "en-US"}
     if params:
         p.update(params)
     r = await client.get(TMDB + path, params=p)
-    if r.status_code != 200:
-        return None
-    return r.json()
+    return r.json() if r.status_code == 200 else None
 
-
-async def resolve_meta(client: httpx.AsyncClient, id_core: str, is_tv: bool, notes: list):
+async def resolve_meta(client, id_core, is_tv, notes):
     if id_core.startswith("tmdb:"):
         tmdb_id = id_core.split(":", 1)[1]
         path = f"/tv/{tmdb_id}" if is_tv else f"/movie/{tmdb_id}"
@@ -334,7 +229,6 @@ async def resolve_meta(client: httpx.AsyncClient, id_core: str, is_tv: bool, not
             "description": m.get("overview") or "",
             "genres": [g.get("name") for g in (m.get("genres") or []) if g.get("name")],
         }
-
     imdb = id_core
     kind = "series" if is_tv else "movie"
     try:
@@ -363,9 +257,8 @@ async def resolve_meta(client: httpx.AsyncClient, id_core: str, is_tv: bool, not
                     "description": meta.get("description") or "",
                     "genres": meta.get("genres") or [],
                 }
-    except Exception as e:
-        notes.append(f"cinemeta EX {e}")
-
+    except Exception as ex:
+        notes.append(f"cinemeta EX {ex}")
     find = await tmdb_get(client, f"/find/{imdb}", {"external_source": "imdb_id"})
     arr = ((find or {}).get("tv_results" if is_tv else "movie_results") or [])
     if not arr:
@@ -382,123 +275,137 @@ async def resolve_meta(client: httpx.AsyncClient, id_core: str, is_tv: bool, not
         "genres": [],
     }
 
+async def get_seed(client, media_id):
+    now = time.time()
+    cached = _seed_cache.get(media_id)
+    if cached and cached[0] > now:
+        return cached[1]
+    try:
+        r = await client.get(f"{STREAM_API}/seed", params={"mediaId": media_id}, timeout=15.0)
+        if r.status_code != 200:
+            return None
+        j = r.json()
+        seed = j.get("seed")
+        ttl = min(int(j.get("ttlMs") or 30000) / 1000.0, 25.0)
+        if seed:
+            _seed_cache[media_id] = (now + ttl - 3, seed)
+        return seed
+    except Exception:
+        return None
 
-def meta_obj(m: dict, typ: str, videos=None):
-    out = {
-        "id": m.get("imdb") or f"tmdb:{m['tmdb']}",
-        "type": typ,
-        "name": m.get("title") or "",
-        "poster": m.get("poster") or "",
-        "background": m.get("background") or "",
-        "description": m.get("description") or "",
-        "releaseInfo": m.get("year") or "",
-        "genres": m.get("genres") or [],
-        "imdb_id": m.get("imdb") or "",
+async def probe_m3u8(client, url):
+    """True nếu playlist sống và là HLS."""
+    try:
+        r = await client.get(url, timeout=12.0, headers=HDR)
+        if r.status_code != 200:
+            return False
+        body = (r.text or "")[:200].lstrip()
+        return body.startswith("#EXTM3U")
+    except Exception:
+        return False
+
+
+async def fetch_city(client, city, meta, is_tv, season, episode, seed):
+    params = {
+        "title": meta["title"],
+        "mediaType": "tv" if is_tv else "movie",
+        "year": meta.get("year") or "",
+        "tmdbId": meta["tmdb"],
+        "imdbId": meta.get("imdb") or "",
+        "enc": "2",
+        "seed": seed,
     }
-    if videos:
-        out["videos"] = videos
-    return out
+    if is_tv:
+        params["seasonId"] = season or 1
+        params["episodeId"] = episode or 1
+    try:
+        r = await client.get(f"{STREAM_API}/{city}/sources", params=params, timeout=20.0)
+        if r.status_code != 200:
+            return []
+        raw = r.text.strip()
+        if raw.startswith("{"):
+            return []
+        data = json.loads(streamcrypto_decrypt(raw, seed, meta["tmdb"]))
+        candidates = []
+        for s in data.get("sources") or []:
+            url = s.get("url") or ""
+            if not url.startswith("http"):
+                continue
+            h = height_from_text(url) or height_from_text(str(s.get("quality") or ""))
+            if h < MIN_HEIGHT:
+                continue
+            candidates.append({
+                "city": city,
+                "height": h,
+                "url": url,
+                "quality": s.get("quality") or height_label(h),
+            })
+        if not candidates:
+            return []
+        ok_flags = await asyncio.gather(*[probe_m3u8(client, c["url"]) for c in candidates])
+        return [c for c, ok in zip(candidates, ok_flags) if ok]
+    except Exception:
+        return []
 
 
-def build_stream_entry(meta: dict, is_tv: bool, season, episode, item: dict) -> dict:
+def build_stream_entry(meta, is_tv, season, episode, item):
     h = int(item.get("height") or 1080)
     qlabel = height_label(h)
-    if h >= 2160:
-        res = "3840×2160"
-    elif h >= 1440:
-        res = "2560×1440"
-    else:
-        res = "1920×1080"
-    src = item.get("src") or "Atlantic"
-    server = item.get("server") or src
+    res = "3840×2160" if h >= 2160 else ("2560×1440" if h >= 1440 else "1920×1080")
+    city = item.get("city") or "Movy"
     if is_tv:
         head = f"{meta['title']} S{int(season or 1):02d}E{int(episode or 1):02d}"
     else:
         head = f"{meta['title']} ({meta['year']})" if meta.get("year") else meta["title"]
     imdb = meta.get("imdb") or ""
-    title = "\n".join(
-        [
-            head,
-            f"{qlabel} · HLS · {src} · {server}",
-            f"H.264 · {res}",
-            f"TMDb {meta['tmdb']}" + (f" · IMDb {imdb}" if imdb else ""),
-        ]
-    )
-    # Master playlist nếu có — player tự chọn quality; CDN bắt buộc Referer
-    play_url = item.get("master") or item.get("url") or ""
+    title = "\n".join([
+        head,
+        f"{qlabel} · HLS · Movy · {city.title()}",
+        f"H.264 · {res}",
+        f"TMDb {meta['tmdb']}" + (f" · IMDb {imdb}" if imdb else ""),
+    ])
     return {
         "name": f"{APP_NAME} · {qlabel}",
         "title": title,
-        "url": play_url,
+        "url": item["url"],
         "behaviorHints": {
             "notWebReady": True,
-            "bingeGroup": f"atlantic-{meta['tmdb']}-{src}-{h}",
+            "bingeGroup": f"movy-{meta['tmdb']}-{city}-{h}",
             "filename": f"{meta['title']} [{qlabel}].m3u8".replace("/", "-"),
             "proxyHeaders": {
                 "request": {
                     "User-Agent": UA,
-                    "Referer": "https://atlantic.st/",
-                    "Origin": "https://atlantic.st",
+                    "Referer": "https://www.movy.sx/",
+                    "Origin": "https://www.movy.sx",
                     "Accept": "*/*",
-                    "Accept-Language": "en-US,en;q=0.9",
                 }
             },
         },
     }
 
-
 @app.get("/")
 @app.get("/manifest.json")
 async def manifest():
-    return cors(
-        JSONResponse(
-            {
-                "id": APP_ID,
-                "version": VERSION,
-                "name": APP_NAME,
-                "description": "Atlantic.st — Helios + Aphrodite (≥1080 / 4K khi có)",
-                "logo": "https://atlantic.st/icon.svg",
-                "resources": ["catalog", "meta", "stream"],
-                "types": ["movie", "series"],
-                "idPrefixes": ["tt", "tmdb:"],
-                "catalogs": [
-                    {
-                        "type": "movie",
-                        "id": "atlantic-movie-popular",
-                        "name": "Atlantic Movies",
-                        "extra": [
-                            {"name": "skip"},
-                            {"name": "search", "isRequired": False},
-                        ],
-                    },
-                    {
-                        "type": "series",
-                        "id": "atlantic-series-popular",
-                        "name": "Atlantic Series",
-                        "extra": [
-                            {"name": "skip"},
-                            {"name": "search", "isRequired": False},
-                        ],
-                    },
-                ],
-            }
-        )
-    )
-
+    return cors(JSONResponse({
+        "id": APP_ID,
+        "version": VERSION,
+        "name": APP_NAME,
+        "description": "Movy.sx — multi-server HLS (≥1080 / 4K khi có)",
+        "logo": "https://www.movy.sx/favicon.svg",
+        "resources": ["catalog", "meta", "stream"],
+        "types": ["movie", "series"],
+        "idPrefixes": ["tt", "tmdb:"],
+        "catalogs": [
+            {"type": "movie", "id": "movy-movie-popular", "name": "Movy Movies",
+             "extra": [{"name": "skip"}, {"name": "search", "isRequired": False}]},
+            {"type": "series", "id": "movy-series-popular", "name": "Movy Series",
+             "extra": [{"name": "skip"}, {"name": "search", "isRequired": False}]},
+        ],
+    }))
 
 @app.get("/health")
 async def health():
-    return cors(
-        JSONResponse(
-            {
-                "ok": True,
-                "version": VERSION,
-                "aesgcm": AESGCM is not None,
-                "streamViaVps": False,
-            }
-        )
-    )
-
+    return cors(JSONResponse({"ok": True, "version": VERSION, "streamViaVps": False}))
 
 @app.get("/catalog/{type}/{id_path:path}")
 async def catalog(type: str, id_path: str):
@@ -520,39 +427,30 @@ async def catalog(type: str, id_path: str):
     page = skip // 20 + 1
     async with httpx.AsyncClient(timeout=20.0, headers=HDR, follow_redirects=True) as client:
         if search:
-            path = "/search/tv" if is_tv else "/search/movie"
-            data = await tmdb_get(client, path, {"query": search, "page": page})
+            data = await tmdb_get(client, "/search/tv" if is_tv else "/search/movie", {"query": search, "page": page})
         else:
-            path = "/tv/popular" if is_tv else "/movie/popular"
-            data = await tmdb_get(client, path, {"page": page})
+            data = await tmdb_get(client, "/tv/popular" if is_tv else "/movie/popular", {"page": page})
         metas = []
         for it in (data or {}).get("results") or []:
             tid = it.get("id")
             title = it.get("title") or it.get("name") or ""
-            poster = (
-                f"https://image.tmdb.org/t/p/w500{it['poster_path']}"
-                if it.get("poster_path")
-                else ""
-            )
+            poster = f"https://image.tmdb.org/t/p/w500{it['poster_path']}" if it.get("poster_path") else ""
             year = str(it.get("release_date") or it.get("first_air_date") or "")[:4]
-            metas.append(
-                {
-                    "id": f"tmdb:{tid}",
-                    "type": "series" if is_tv else "movie",
-                    "name": title,
-                    "poster": poster,
-                    "releaseInfo": year,
-                }
-            )
+            metas.append({
+                "id": f"tmdb:{tid}",
+                "type": "series" if is_tv else "movie",
+                "name": title,
+                "poster": poster,
+                "releaseInfo": year,
+            })
         return cors(JSONResponse({"metas": metas}))
-
 
 @app.get("/meta/{type}/{id_path:path}")
 async def meta(type: str, id_path: str):
     id_path = id_path.replace(".json", "")
     id_core, _, _ = parse_stream_id(id_path)
     is_tv = type.lower() in ("series", "tv")
-    notes: list[str] = []
+    notes = []
     async with httpx.AsyncClient(timeout=20.0, headers=HDR, follow_redirects=True) as client:
         m = await resolve_meta(client, id_core, is_tv, notes)
         if not m:
@@ -568,79 +466,75 @@ async def meta(type: str, id_path: str):
                 det = await tmdb_get(client, f"/tv/{m['tmdb']}/season/{sn}")
                 for ep in (det or {}).get("episodes") or []:
                     en = ep.get("episode_number")
-                    videos.append(
-                        {
-                            "id": f"tmdb:{m['tmdb']}:{sn}:{en}",
-                            "title": ep.get("name") or f"Tập {en}",
-                            "season": sn,
-                            "episode": en,
-                            "released": (
-                                (ep.get("air_date") or "") + "T00:00:00.000Z"
-                                if ep.get("air_date")
-                                else None
-                            ),
-                            "thumbnail": (
-                                f"https://image.tmdb.org/t/p/w300{ep['still_path']}"
-                                if ep.get("still_path")
-                                else ""
-                            ),
-                        }
-                    )
-        return cors(
-            JSONResponse({"meta": meta_obj(m, "series" if is_tv else "movie", videos)})
-        )
-
+                    videos.append({
+                        "id": f"tmdb:{m['tmdb']}:{sn}:{en}",
+                        "title": ep.get("name") or f"Tập {en}",
+                        "season": sn,
+                        "episode": en,
+                        "released": ((ep.get("air_date") or "") + "T00:00:00.000Z") if ep.get("air_date") else None,
+                        "thumbnail": f"https://image.tmdb.org/t/p/w300{ep['still_path']}" if ep.get("still_path") else "",
+                    })
+        out = {
+            "id": m.get("imdb") or f"tmdb:{m['tmdb']}",
+            "type": "series" if is_tv else "movie",
+            "name": m.get("title") or "",
+            "poster": m.get("poster") or "",
+            "background": m.get("background") or "",
+            "description": m.get("description") or "",
+            "releaseInfo": m.get("year") or "",
+            "genres": m.get("genres") or [],
+            "imdb_id": m.get("imdb") or "",
+        }
+        if videos:
+            out["videos"] = videos
+        return cors(JSONResponse({"meta": out}))
 
 @app.get("/stream/{type}/{id_path:path}")
 async def stream(type: str, id_path: str, debug: int = 0):
-    notes: list[str] = [f"ver={VERSION}", f"aesgcm={AESGCM is not None}"]
+    notes = [f"ver={VERSION}"]
     id_path = id_path.rstrip("/").replace(".json", "")
     id_core, season, episode = parse_stream_id(id_path)
     is_tv = type.lower() in ("series", "tv") or season is not None
     notes.append(f"id={id_core} tv={is_tv} s={season} e={episode}")
-
     cache_key = f"stream:{VERSION}:{type}:{id_path}"
     cached = cache_get(cache_key)
     if cached is not None and not debug:
         return cors(JSONResponse(cached))
-
     async with httpx.AsyncClient(timeout=30.0, headers=HDR, follow_redirects=True) as client:
         meta = await resolve_meta(client, id_core, is_tv, notes)
         if not meta or not meta.get("tmdb"):
             out = {"streams": [], "notes": notes} if debug else {"streams": []}
             return cors(JSONResponse(out))
         notes.append(f"title={meta['title']} tmdb={meta['tmdb']}")
-
-        helios = await helios_streams(
-            client, meta["tmdb"], is_tv, season, episode, notes
-        )
-        aphro = await aphrodite_streams(
-            client, meta["tmdb"], is_tv, season, episode, notes
-        )
-
-        # Ưu tiên height cao, rồi Helios trước Aphrodite
-        combined = helios + aphro
-        combined.sort(key=lambda x: (-int(x.get("height") or 0), 0 if x.get("src") == "Helios" else 1))
-
+        seed = await get_seed(client, meta["tmdb"])
+        if not seed:
+            notes.append("seed fail")
+            out = {"streams": [], "notes": notes} if debug else {"streams": []}
+            return cors(JSONResponse(out))
+        notes.append("seed ok")
+        results = await asyncio.gather(*[
+            fetch_city(client, city, meta, is_tv, season, episode, seed) for city in CITIES
+        ])
+        combined = []
+        for city, items in zip(CITIES, results):
+            notes.append(f"{city}={len(items)}")
+            combined.extend(items)
+        combined.sort(key=lambda x: -int(x.get("height") or 0))
         seen = set()
         streams = []
         for item in combined:
             u = item.get("url") or ""
             if not u.startswith("http") or u in seen:
                 continue
-            if int(item.get("height") or 0) and int(item["height"]) < MIN_HEIGHT:
-                continue
             seen.add(u)
             streams.append(build_stream_entry(meta, is_tv, season, episode, item))
-
-        out: dict[str, Any] = {"streams": streams}
+        out = {"streams": streams}
         if debug:
             out["notes"] = notes
         cache_set(cache_key, {"streams": streams})
         return cors(JSONResponse(out))
 
-
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=PORT)
+
